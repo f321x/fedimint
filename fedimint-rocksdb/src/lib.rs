@@ -9,6 +9,8 @@ use std::fmt;
 use std::ops::Range;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
 use async_trait::async_trait;
@@ -23,9 +25,12 @@ pub use rocksdb;
 use rocksdb::{
     DBRecoveryMode, OptimisticTransactionDB, OptimisticTransactionOptions, WriteOptions,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
-use crate::envs::{FM_ROCKSDB_BLOCK_CACHE_SIZE_ENV, FM_ROCKSDB_WRITE_BUFFER_SIZE_ENV};
+use crate::envs::{
+    FM_ROCKSDB_BLOCK_CACHE_SIZE_ENV, FM_ROCKSDB_WAL_SYNC_INTERVAL_MS_ENV,
+    FM_ROCKSDB_WRITE_BUFFER_SIZE_ENV,
+};
 
 // turn an `iter` into a `Stream` where every `next` is ran inside
 // `block_in_place` to offload the blocking calls
@@ -42,10 +47,100 @@ where
     })
 }
 
+/// Decides which commits get an `fsync`.
+///
+/// Upstream `fsync`s every commit. Because `AlephBFT` persists one unit per DB
+/// transaction on the consensus critical path (a few dozen per second, forever,
+/// even while the federation is idle), that turns into a constant stream of
+/// tiny synchronous writes. On copy-on-write filesystems each one costs a full
+/// extent allocation plus checksum updates, amplifying ~150 byte records into
+/// megabytes per second of physical writes.
+///
+/// When an interval is configured, commits are written without `fsync` and a
+/// `flush_wal(true)` is issued at most once per interval instead. That call
+/// syncs *every* live WAL file, so it also makes all preceding un-synced
+/// commits durable — this is group commit, not "durability off".
+///
+/// Un-synced commits still reach the OS page cache, so they survive process
+/// death, `SIGKILL`, OOM-kill and container restarts. A power loss or kernel
+/// panic can discard them, back to the last synced commit. (That assumes the
+/// host page cache is the last buffer in the stack; a hypervisor or network
+/// block device caching underneath it can widen the window.)
+///
+/// The sync is claimed at *commit* time, not when a transaction is opened.
+/// `begin_transaction` also serves read-only transactions, which are dropped
+/// without committing — letting one claim the interval would mean the `fsync`
+/// was accounted for but never performed, leaving the window unbounded.
 #[derive(Debug)]
-pub struct RocksDb(rocksdb::OptimisticTransactionDB);
+struct WalSyncPolicy {
+    /// `None` means "`fsync` every commit" (upstream behaviour).
+    interval: Option<Duration>,
+    epoch: Instant,
+    /// Millis since `epoch` from which the next commit may claim the sync slot.
+    /// Starts at 0 so the first commit after opening is always `fsync`-ed.
+    next_sync_millis: AtomicU64,
+}
 
-pub struct RocksDbTransaction<'a>(rocksdb::Transaction<'a, rocksdb::OptimisticTransactionDB>);
+impl WalSyncPolicy {
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(Self::new(parse_env_wal_sync_interval()?))
+    }
+
+    fn new(interval: Option<Duration>) -> Self {
+        Self {
+            interval,
+            epoch: Instant::now(),
+            next_sync_millis: AtomicU64::new(0),
+        }
+    }
+
+    /// Claim this interval's explicit sync, if one is due.
+    ///
+    /// Returns `true` for exactly one caller per interval; that caller must then
+    /// actually perform the sync. Call this only *after* a commit succeeds — a
+    /// claim that does not result in an `fsync` silently widens the window.
+    ///
+    /// Always `false` when no interval is configured: those commits were already
+    /// `fsync`-ed by `WriteOptions`, so an extra flush would be a second,
+    /// redundant `fsync` on the default path.
+    fn claim_sync(&self) -> bool {
+        let Some(interval) = self.interval else {
+            return false;
+        };
+
+        // Saturating conversions: a `u64` of milliseconds cannot realistically
+        // overflow within a process lifetime (~584 million years).
+        let now = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let interval = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
+        let deadline = self.next_sync_millis.load(Ordering::Relaxed);
+
+        if now < deadline {
+            return false;
+        }
+
+        // Compare-and-swap so that exactly one of several concurrent
+        // transactions claims the sync for this interval.
+        self.next_sync_millis
+            .compare_exchange(
+                deadline,
+                now.saturating_add(interval),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+}
+
+#[derive(Debug)]
+pub struct RocksDb {
+    db: rocksdb::OptimisticTransactionDB,
+    wal_sync: WalSyncPolicy,
+}
+
+pub struct RocksDbTransaction<'a>(
+    rocksdb::Transaction<'a, rocksdb::OptimisticTransactionDB>,
+    &'a RocksDb,
+);
 
 #[bon::bon]
 impl RocksDb {
@@ -91,7 +186,24 @@ impl RocksDb {
         relaxed_consistency: bool,
     ) -> anyhow::Result<RocksDb> {
         let mut opts = get_default_options()?;
-        if relaxed_consistency {
+        let wal_sync = WalSyncPolicy::from_env()?;
+
+        if wal_sync.interval.is_some() {
+            // `PointInTime` stops replaying at the first gap, yielding a
+            // consistent prefix of committed transactions.
+            //
+            // `TolerateCorruptedTailRecords` is NOT sufficient here. RocksDB
+            // keeps a deque of WAL files and rotates on every memtable switch,
+            // so between two syncs there can be several un-synced WAL files at
+            // once. Kernel writeback across separate files is unordered, so a
+            // retired WAL can lose its tail while a newer one is fully
+            // persisted. `TolerateCorruptedTailRecords` silently stops reading
+            // the torn file and then replays the newer one in full, producing a
+            // database with a *hole* rather than a shorter prefix. Consensus
+            // replay tolerates having fewer items than the federation; it does
+            // not tolerate missing items in the middle.
+            opts.set_wal_recovery_mode(DBRecoveryMode::PointInTime);
+        } else if relaxed_consistency {
             // https://github.com/fedimint/fedimint/issues/8072
             opts.set_wal_recovery_mode(DBRecoveryMode::TolerateCorruptedTailRecords);
         } else {
@@ -99,13 +211,26 @@ impl RocksDb {
             // WAL and should rather fail in this case
             opts.set_wal_recovery_mode(DBRecoveryMode::AbsoluteConsistency);
         }
+
+        if let Some(interval) = wal_sync.interval {
+            // Warn, not debug: this is a durability relaxation that applies to
+            // every process reading the env var, and it must be visible at
+            // default log levels.
+            warn!(
+                target: "fedimint-rocksdb",
+                interval_ms = interval.as_millis(),
+                path = %db_path.display(),
+                "Durability relaxed: commits are not individually fsynced"
+            );
+        }
+
         let db: rocksdb::OptimisticTransactionDB =
             rocksdb::OptimisticTransactionDB::<rocksdb::SingleThreaded>::open(&opts, db_path)?;
-        Ok(RocksDb(db))
+        Ok(RocksDb { db, wal_sync })
     }
 
     pub fn inner(&self) -> &rocksdb::OptimisticTransactionDB {
-        &self.0
+        &self.db
     }
 }
 
@@ -163,6 +288,42 @@ fn parse_env_size(env_name: &str) -> anyhow::Result<Option<usize>> {
     Ok(Some(size))
 }
 
+/// Upper bound on the configurable sync interval. Beyond this the setting
+/// stops being "bounded durability" and becomes "effectively never sync", which
+/// is much more likely to be a typo or a seconds/milliseconds mix-up than an
+/// intent.
+const MAX_WAL_SYNC_INTERVAL_MS: u64 = 60_000;
+
+/// Parse [`FM_ROCKSDB_WAL_SYNC_INTERVAL_MS_ENV`].
+///
+/// Unset or `0` yields `None`, meaning every commit is `fsync`-ed.
+fn parse_env_wal_sync_interval() -> anyhow::Result<Option<Duration>> {
+    parse_env_wal_sync_interval_from(
+        std::env::var(FM_ROCKSDB_WAL_SYNC_INTERVAL_MS_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Env-independent core of [`parse_env_wal_sync_interval`], so it is testable
+/// without mutating process-global state.
+fn parse_env_wal_sync_interval_from(var: Option<&str>) -> anyhow::Result<Option<Duration>> {
+    let Some(var) = var else {
+        return Ok(None);
+    };
+    let millis: u64 = FromStr::from_str(var.trim()).with_context(|| {
+        format!("Could not parse {FM_ROCKSDB_WAL_SYNC_INTERVAL_MS_ENV} as milliseconds")
+    })?;
+    if millis > MAX_WAL_SYNC_INTERVAL_MS {
+        bail!(
+            "{FM_ROCKSDB_WAL_SYNC_INTERVAL_MS_ENV} is {millis}ms, refusing anything above \
+             {MAX_WAL_SYNC_INTERVAL_MS}ms; a larger value would leave writes un-synced almost \
+             indefinitely"
+        );
+    }
+    Ok((millis != 0).then(|| Duration::from_millis(millis)))
+}
+
 fn get_default_options() -> anyhow::Result<rocksdb::Options> {
     let mut opts = rocksdb::Options::default();
 
@@ -218,13 +379,25 @@ impl RocksDbReadOnly {
 
 impl From<rocksdb::OptimisticTransactionDB> for RocksDb {
     fn from(db: OptimisticTransactionDB) -> Self {
-        RocksDb(db)
+        // This conversion cannot report errors, so a malformed interval falls
+        // back to the conservative "fsync every commit" behaviour. The path
+        // fedimintd actually uses (`open_blocking_unlocked`) surfaces the error
+        // at startup instead.
+        let wal_sync = WalSyncPolicy::from_env().unwrap_or_else(|err| {
+            warn!(
+                target: "fedimint-rocksdb",
+                err = %err,
+                "Ignoring invalid WAL sync interval, syncing every commit"
+            );
+            WalSyncPolicy::new(None)
+        });
+        RocksDb { db, wal_sync }
     }
 }
 
 impl From<RocksDb> for rocksdb::OptimisticTransactionDB {
     fn from(db: RocksDb) -> Self {
-        db.0
+        db.db
     }
 }
 
@@ -260,15 +433,26 @@ impl IRawDatabase for RocksDb {
         optimistic_options.set_snapshot(true);
 
         let mut write_options = WriteOptions::default();
-        // Make sure we never lose data on unclean shutdown
-        write_options.set_sync(true);
+        // Make sure we never lose data on unclean shutdown, unless the operator
+        // explicitly opted into a bounded window via
+        // `FM_ROCKSDB_WAL_SYNC_INTERVAL_MS`. See `WalSyncPolicy`.
+        //
+        // Deliberately NOT decided here: this is also the entry point for
+        // read-only transactions (`begin_transaction_nc`), which are dropped
+        // without ever committing. Deciding here would let a reader consume the
+        // interval's sync and never perform it. The sync is issued explicitly
+        // after a successful commit instead.
+        write_options.set_sync(self.wal_sync.interval.is_none());
 
-        RocksDbTransaction(self.0.transaction_opt(&write_options, &optimistic_options))
+        RocksDbTransaction(
+            self.db.transaction_opt(&write_options, &optimistic_options),
+            self,
+        )
     }
 
     fn checkpoint(&self, backup_path: &Path) -> DatabaseResult<()> {
         let checkpoint =
-            rocksdb::checkpoint::Checkpoint::new(&self.0).map_err(DatabaseError::backend)?;
+            rocksdb::checkpoint::Checkpoint::new(&self.db).map_err(DatabaseError::backend)?;
         checkpoint
             .create_checkpoint(backup_path)
             .map_err(DatabaseError::backend)?;
@@ -422,9 +606,22 @@ impl IDatabaseTransactionOps for RocksDbTransaction<'_> {}
 #[async_trait]
 impl IRawDatabaseTransaction for RocksDbTransaction<'_> {
     async fn commit_tx(self) -> DatabaseResult<()> {
+        let db = self.1;
         fedimint_core::runtime::block_in_place(|| {
             match self.0.commit() {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    // Only a commit that actually succeeded may claim the
+                    // interval's sync, so read-only and rolled-back
+                    // transactions cannot consume it without performing it.
+                    if db.wal_sync.claim_sync() {
+                        // Syncs every live WAL, so this also makes all
+                        // preceding un-synced commits durable.
+                        if let Err(err) = db.db.flush_wal(true) {
+                            return Err(DatabaseError::backend(err));
+                        }
+                    }
+                    Ok(())
+                }
                 Err(err) => {
                     // RocksDB's OptimisticTransactionDB can return Busy/TryAgain errors
                     // when concurrent transactions conflict on the same keys.
@@ -539,6 +736,151 @@ impl IDatabaseTransactionOps for RocksDbReadOnlyTransaction<'_> {}
 impl IRawDatabaseTransaction for RocksDbReadOnlyTransaction<'_> {
     async fn commit_tx(self) -> DatabaseResult<()> {
         panic!("Cannot commit a read only transaction");
+    }
+}
+
+#[cfg(test)]
+mod wal_sync_policy_tests {
+    use super::*;
+
+    /// With no interval configured, `WriteOptions` already `fsync`s every
+    /// commit, so the commit path must not issue a second, redundant flush.
+    #[test]
+    fn no_explicit_sync_when_disabled() {
+        let policy = WalSyncPolicy::new(None);
+        for _ in 0..100 {
+            assert!(
+                !policy.claim_sync(),
+                "default path must not add an extra fsync on top of set_sync(true)"
+            );
+        }
+    }
+
+    #[test]
+    fn syncs_first_commit_then_rate_limits() {
+        let policy = WalSyncPolicy::new(Some(Duration::from_secs(30)));
+
+        // The commit right after opening must be durable.
+        assert!(policy.claim_sync());
+
+        // Everything within the interval rides on that fsync.
+        for _ in 0..100 {
+            assert!(!policy.claim_sync());
+        }
+    }
+
+    #[test]
+    fn syncs_again_once_interval_elapses() {
+        let policy = WalSyncPolicy::new(Some(Duration::from_millis(50)));
+
+        assert!(policy.claim_sync());
+        assert!(!policy.claim_sync());
+
+        std::thread::sleep(Duration::from_millis(75));
+
+        // A new interval means a new fsync, which also makes every commit
+        // skipped above durable.
+        assert!(policy.claim_sync());
+        assert!(!policy.claim_sync());
+    }
+
+    #[test]
+    fn only_one_concurrent_commit_claims_the_sync() {
+        let policy = std::sync::Arc::new(WalSyncPolicy::new(Some(Duration::from_secs(30))));
+        let claims = std::sync::Arc::new(AtomicU64::new(0));
+
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let policy = policy.clone();
+                let claims = claims.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        if policy.claim_sync() {
+                            claims.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for thread in threads {
+            thread.join().expect("thread panicked");
+        }
+
+        // Racing transactions must not each take the slot for one interval.
+        assert_eq!(claims.load(Ordering::Relaxed), 1);
+    }
+
+    /// Regression test: opening transactions must not consume the interval's
+    /// sync. `begin_transaction` also serves read-only transactions, which are
+    /// dropped without committing, so claiming there would account for an
+    /// `fsync` that never happens and leave the un-synced window unbounded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_only_transactions_do_not_consume_the_sync() {
+        let dir = tempfile::Builder::new()
+            .prefix("fm-walsync")
+            .tempdir()
+            .expect("tempdir");
+
+        let db = RocksDb::open_blocking_unlocked(&dir.path().join("db"), false).expect("open");
+        // Simulate a configured interval without touching process-global env.
+        let db = RocksDb {
+            wal_sync: WalSyncPolicy::new(Some(Duration::from_millis(1))),
+            ..db
+        };
+
+        // Well past the interval, so any claim would be granted.
+        std::thread::sleep(Duration::from_millis(5));
+
+        for _ in 0..50 {
+            let tx = db.begin_transaction().await;
+            drop(tx);
+        }
+
+        assert_eq!(
+            db.wal_sync.next_sync_millis.load(Ordering::Relaxed),
+            0,
+            "opening (and dropping) transactions must leave the sync unclaimed"
+        );
+
+        // A real commit does claim it.
+        let mut tx = db.begin_transaction().await;
+        tx.raw_insert_bytes(b"k", b"v").await.expect("insert");
+        tx.commit_tx().await.expect("commit");
+
+        assert_ne!(
+            db.wal_sync.next_sync_millis.load(Ordering::Relaxed),
+            0,
+            "a committed transaction must claim the sync"
+        );
+    }
+
+    #[test]
+    fn rejects_absurd_intervals() {
+        assert!(
+            parse_env_wal_sync_interval_from(Some(&MAX_WAL_SYNC_INTERVAL_MS.to_string())).is_ok()
+        );
+        assert!(
+            parse_env_wal_sync_interval_from(Some(&(MAX_WAL_SYNC_INTERVAL_MS + 1).to_string()))
+                .is_err(),
+            "an interval past the cap must be rejected, not silently disable syncing"
+        );
+        assert!(parse_env_wal_sync_interval_from(Some(&u64::MAX.to_string())).is_err());
+    }
+
+    #[test]
+    fn zero_and_unset_mean_sync_every_commit() {
+        // Guards the default: the patch must be inert unless opted into.
+        assert_eq!(parse_env_wal_sync_interval_from(None).expect("valid"), None);
+        assert_eq!(
+            parse_env_wal_sync_interval_from(Some("0")).expect("valid"),
+            None
+        );
+        assert_eq!(
+            parse_env_wal_sync_interval_from(Some(" 5000 ")).expect("valid"),
+            Some(Duration::from_secs(5))
+        );
+        assert!(parse_env_wal_sync_interval_from(Some("nonsense")).is_err());
     }
 }
 
