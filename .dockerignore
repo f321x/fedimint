@@ -1,6 +1,6 @@
-# Cargo build directory.
-/target
-/target-nix
-
-# Nix build directory.
-/result
+# Keep the build context small. `target/` alone is multiple GB and would
+# otherwise be uploaded to the build daemon on every build.
+target/
+.git/
+result
+*.qcow2

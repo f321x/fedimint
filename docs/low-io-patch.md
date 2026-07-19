@@ -77,11 +77,19 @@ database path whenever it is active.
 scripts/build-lowio-container.sh
 ```
 
-Requires `nix` (flakes enabled) and `podman`. First build is slow; the
-`fedimint.cachix.org` substituter declared in `flake.nix` supplies prebuilt dependencies.
+Requires only `podman`. The build runs inside containers via `Containerfile.lowio`, so no
+Rust toolchain or build dependency is installed on the host. Expect 30-60 minutes and
+several GB of scratch space on the first run — `librocksdb-sys` dominates. The result is
+tagged both `fedimintd:lowio-<describe>` and `fedimintd:lowio` (a stable alias, so the
+quadlet does not need editing after each rebuild).
 
-The script refuses to build if the patch is not committed — Nix flakes only see
-git-tracked files, so an unstaged patch silently builds *unpatched* source.
+This image is **not** byte-identical to the official one: upstream builds a Nix layered
+image, this is Debian bookworm with the same entrypoint, `FM_DATA_DIR`, workdir, volume and
+ports. Functionally equivalent, different base.
+
+To reproduce the official image instead, `scripts/build-lowio-container.sh --nix` — that
+path needs `nix` with flakes, and refuses to build on a dirty tree, since Nix flakes only
+see git-tracked files and would otherwise silently build *unpatched* source.
 
 ## Rebasing onto a new release
 

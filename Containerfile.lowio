@@ -1,0 +1,62 @@
+# Build fedimintd without Nix, using only podman/docker.
+# See docs/low-io-patch.md
+#
+# This does NOT reproduce the official image bit-for-bit: upstream builds a Nix
+# layered image, this is plain Debian. Functionally equivalent, different base.
+
+ARG RUST_VERSION=1.96-bookworm
+ARG DEBIAN_RELEASE=bookworm
+
+FROM docker.io/library/rust:${RUST_VERSION} AS builder
+
+# librocksdb-sys needs clang/libclang (bindgen) and cmake. openssl/zlib headers
+# are already in the buildpack-deps base the rust image derives from, but are
+# listed explicitly so this does not silently break if that base changes.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang \
+        libclang-dev \
+        cmake \
+        pkg-config \
+        libssl-dev \
+        libsqlite3-dev \
+        zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# `.git` is excluded from the build context (it is large), so fedimint-build
+# cannot derive the commit itself and would stamp all zeros. Pass it in.
+ARG FEDIMINT_BUILD_FORCE_GIT_HASH
+ENV FEDIMINT_BUILD_FORCE_GIT_HASH=${FEDIMINT_BUILD_FORCE_GIT_HASH}
+
+COPY . .
+
+# --locked: build exactly the dependency versions in Cargo.lock, so the image
+# matches what was tested rather than whatever resolves today.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked --bin fedimintd \
+    && cp target/release/fedimintd /usr/local/bin/fedimintd
+
+FROM docker.io/library/debian:${DEBIAN_RELEASE}-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libssl3 \
+        libsqlite3-0 \
+        libstdc++6 \
+        zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/fedimintd /usr/local/bin/fedimintd
+COPY misc/fedimintd-container-entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Matches the official image so an existing quadlet keeps working unchanged.
+ENV FM_DATA_DIR=/data
+WORKDIR /data
+VOLUME /data
+EXPOSE 8173/tcp 8174/tcp
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD []
